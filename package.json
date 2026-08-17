@@ -1,0 +1,15 @@
+{
+  "name": "transformat",
+  "version": "1.0.0",
+  "description": "Tiny API that wraps LibreOffice headless to convert DOC/DOCX/PPT files",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1"
+  }
+}
