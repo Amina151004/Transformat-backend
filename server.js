@@ -7,30 +7,31 @@ import fs from 'fs';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Where uploaded files land, and where LibreOffice will drop the converted output.
 const UPLOAD_DIR = path.resolve('uploads');
 const CONVERTED_DIR = path.resolve('converted');
 
-// Only allow converting TO these formats — keeps the API from running
-// arbitrary LibreOffice commands.
 const ALLOWED_FORMATS = ['pdf', 'docx', 'doc', 'pptx', 'ppt'];
 
-// multer needs to know where to save incoming files.
-const upload = multer({ dest: UPLOAD_DIR });
+// Preserve the original extension so LibreOffice can correctly
+// detect the input file type — without it, conversion is unreliable.
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname); // e.g. ".pdf"
+    const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+    cb(null, uniqueName);
+  },
+});
+const upload = multer({ storage });
 
-// A simple "is this thing alive" route.
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-// The main endpoint. Expects:
-//   - a file, sent as multipart form field "file"
-//   - a target format, sent as form field "to" (e.g. "pdf")
 app.post('/convert', upload.single('file'), (req, res) => {
   const inputFile = req.file;
   const targetFormat = req.body.to;
 
-  // --- Basic validation before we run anything ---
   if (!inputFile) {
     return res.status(400).json({ error: 'No file uploaded (field name must be "file")' });
   }
@@ -40,10 +41,6 @@ app.post('/convert', upload.single('file'), (req, res) => {
 
   const inputPath = inputFile.path;
 
-  // LibreOffice headless command:
-  // --headless        -> no GUI window
-  // --convert-to X     -> target format
-  // --outdir Y          -> where to write the result
   const command = `libreoffice --headless --convert-to ${targetFormat} --outdir ${CONVERTED_DIR} ${inputPath}`;
 
   exec(command, (error, stdout, stderr) => {
@@ -52,15 +49,19 @@ app.post('/convert', upload.single('file'), (req, res) => {
       return res.status(500).json({ error: 'Conversion failed' });
     }
 
-    // LibreOffice keeps the original filename and just swaps the extension.
-    const outputFileName = path.basename(inputPath) + `.${targetFormat}`;
+    // LibreOffice REPLACES the input extension with the target one,
+    // it does not append to the full filename.
+    const inputExt = path.extname(inputPath);
+    const inputBaseName = path.basename(inputPath, inputExt);
+    const outputFileName = `${inputBaseName}.${targetFormat}`;
     const outputPath = path.join(CONVERTED_DIR, outputFileName);
 
     if (!fs.existsSync(outputPath)) {
+      console.error('Expected output at:', outputPath);
+      console.error('LibreOffice stdout:', stdout);
       return res.status(500).json({ error: 'Converted file not found' });
     }
 
-    // Send the converted file back, then clean up both temp files.
     res.download(outputPath, `converted.${targetFormat}`, () => {
       fs.unlink(inputPath, () => {});
       fs.unlink(outputPath, () => {});
