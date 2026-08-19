@@ -5,6 +5,8 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import sharp from 'sharp';
+import { Document, Packer, Paragraph, ImageRun } from 'docx';
+import pptxgen from 'pptxgenjs';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -17,21 +19,27 @@ const IMAGE_FORMATS = ['png', 'jpg', 'jpeg'];
 const ALLOWED_FORMATS = [...DOCUMENT_FORMATS, ...IMAGE_FORMATS];
 
 // What each source extension can actually convert to.
-// PDF -> DOCX/DOC/PPTX/PPT is intentionally excluded: LibreOffice's
-// PDF import is Draw-based on the version we're running, and Draw has
-// no export filter to Writer/Impress formats. Revisit if LibreOffice
-// is upgraded to a version with native "PDF as Writer" import.
+//
+// docx/pptx <-> each other and pdf -> pptx are intentionally excluded:
+// there's no reliable free path that reconstructs editable text/shapes
+// across those format families. LibreOffice's PDF/PPTX import for this
+// direction is Draw-based with no export filter to Writer/Impress, and
+// no equivalent free library exists (unlike pdf2docx for PDF->Writer).
+// Revisit if a paid API (CloudConvert/Adobe) is ever wired in.
 function getValidTargets(sourceExt) {
   const ext = sourceExt.toLowerCase().replace('.', '');
 
-  if (['docx', 'doc', 'pptx', 'ppt'].includes(ext)) {
+  if (['docx', 'doc'].includes(ext)) {
+    return ['pdf', 'png', 'jpeg'];
+  }
+  if (['pptx', 'ppt'].includes(ext)) {
     return ['pdf', 'png', 'jpeg'];
   }
   if (ext === 'pdf') {
-    return ['png', 'jpeg'];
+    return ['png', 'jpeg', 'docx', 'doc']; // pptx intentionally excluded
   }
   if (IMAGE_FORMATS.includes(ext)) {
-    return [...IMAGE_FORMATS.filter((f) => f !== ext), 'pdf'];
+    return [...IMAGE_FORMATS.filter((f) => f !== ext), 'pdf', 'docx', 'pptx'];
   }
   return [];
 }
@@ -45,6 +53,65 @@ const storage = multer.diskStorage({
   },
 });
 const upload = multer({ storage });
+
+// ---------------------------------------------------------------------
+// Conversion helpers
+// ---------------------------------------------------------------------
+
+// Embed an image as a full page in a new Word document.
+async function imageToDocx(inputPath, outputPath) {
+  const imageBuffer = fs.readFileSync(inputPath);
+  const metadata = await sharp(inputPath).metadata();
+
+  // Fit inside a standard page area, keeping aspect ratio
+  const maxWidth = 550;
+  const maxHeight = 720;
+  const ratio = Math.min(maxWidth / metadata.width, maxHeight / metadata.height, 1);
+  const width = Math.round(metadata.width * ratio);
+  const height = Math.round(metadata.height * ratio);
+
+  const doc = new Document({
+    sections: [
+      {
+        children: [
+          new Paragraph({
+            children: [new ImageRun({ data: imageBuffer, transformation: { width, height } })],
+          }),
+        ],
+      },
+    ],
+  });
+
+  const buffer = await Packer.toBuffer(doc);
+  fs.writeFileSync(outputPath, buffer);
+}
+
+// Embed an image as a full slide in a new PowerPoint file.
+async function imageToPptx(inputPath, outputPath) {
+  const metadata = await sharp(inputPath).metadata();
+  const pres = new pptxgen();
+  const slide = pres.addSlide();
+
+  const slideW = pres.width;  // inches, default 10
+  const slideH = pres.height; // default 7.5
+
+  const imgRatio = metadata.width / metadata.height;
+  let w = slideW;
+  let h = w / imgRatio;
+  if (h > slideH) {
+    h = slideH;
+    w = h * imgRatio;
+  }
+  const x = (slideW - w) / 2;
+  const y = (slideH - h) / 2;
+
+  slide.addImage({ path: inputPath, x, y, w, h });
+  await pres.writeFile({ fileName: outputPath });
+}
+
+// ---------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
@@ -84,6 +151,9 @@ app.post('/convert', upload.single('file'), async (req, res) => {
   }
 
   const isImageToImage = IMAGE_FORMATS.includes(inputExt) && IMAGE_FORMATS.includes(targetFormat);
+  const isImageToDocx = IMAGE_FORMATS.includes(inputExt) && ['docx', 'doc'].includes(targetFormat);
+  const isImageToPptx = IMAGE_FORMATS.includes(inputExt) && ['pptx', 'ppt'].includes(targetFormat);
+  const isPdfToWord = inputExt === 'pdf' && ['docx', 'doc'].includes(targetFormat);
 
   // --- Image -> Image: handled directly with sharp, no LibreOffice needed ---
   if (isImageToImage) {
@@ -102,6 +172,75 @@ app.post('/convert', upload.single('file'), async (req, res) => {
       fs.unlink(inputPath, () => {});
       return res.status(500).json({ error: 'Image conversion failed' });
     }
+  }
+
+  // --- Image -> DOCX: embed image full-page in a new Word doc ---
+  if (isImageToDocx) {
+    const inputBaseName = path.basename(inputPath, path.extname(inputPath));
+    const outputPath = path.join(CONVERTED_DIR, `${inputBaseName}.docx`);
+    try {
+      await imageToDocx(inputPath, outputPath);
+      return res.download(outputPath, 'converted.docx', () => {
+        fs.unlink(inputPath, () => {});
+        fs.unlink(outputPath, () => {});
+      });
+    } catch (err) {
+      console.error('image->docx conversion failed:', err.message);
+      fs.unlink(inputPath, () => {});
+      return res.status(500).json({ error: 'Image to DOCX conversion failed' });
+    }
+  }
+
+  // --- Image -> PPTX: embed image full-slide in a new PowerPoint file ---
+  if (isImageToPptx) {
+    const inputBaseName = path.basename(inputPath, path.extname(inputPath));
+    const outputPath = path.join(CONVERTED_DIR, `${inputBaseName}.pptx`);
+    try {
+      await imageToPptx(inputPath, outputPath);
+      return res.download(outputPath, 'converted.pptx', () => {
+        fs.unlink(inputPath, () => {});
+        fs.unlink(outputPath, () => {});
+      });
+    } catch (err) {
+      console.error('image->pptx conversion failed:', err.message);
+      fs.unlink(inputPath, () => {});
+      return res.status(500).json({ error: 'Image to PPTX conversion failed' });
+    }
+  }
+
+  // --- PDF -> DOCX/DOC: handled by the pdf2docx Python sidecar script ---
+  if (isPdfToWord) {
+    const inputBaseName = path.basename(inputPath, path.extname(inputPath));
+    const outputFileName = `${inputBaseName}.docx`; // pdf2docx only writes .docx
+    const outputPath = path.join(CONVERTED_DIR, outputFileName);
+
+    const pyCommand = `/opt/pdf2docx-venv/bin/python3 convert_pdf.py "${inputPath}" "${outputPath}"`;
+
+    exec(pyCommand, { timeout: 120000 }, (error, stdout, stderr) => {
+      console.log('PDF->DOCX command:', pyCommand);
+      console.log('stdout:', stdout);
+      console.log('stderr:', stderr);
+
+      if (error) {
+        console.error('pdf2docx conversion failed:', error.message);
+        fs.unlink(inputPath, () => {});
+        return res.status(500).json({ error: 'PDF to DOCX conversion failed' });
+      }
+
+      if (!fs.existsSync(outputPath)) {
+        console.error('Expected output at:', outputPath);
+        fs.unlink(inputPath, () => {});
+        return res.status(500).json({ error: 'Converted file not found' });
+      }
+
+      // targetFormat may be "doc" -- we still hand back a .docx file either way,
+      // since pdf2docx doesn't produce legacy .doc
+      res.download(outputPath, 'converted.docx', () => {
+        fs.unlink(inputPath, () => {});
+        fs.unlink(outputPath, () => {});
+      });
+    });
+    return; // stop here, don't fall through to the LibreOffice block
   }
 
   // --- Everything else (documents, doc->pdf, doc/image->pdf, pdf->image): LibreOffice ---
