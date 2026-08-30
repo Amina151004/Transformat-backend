@@ -7,6 +7,8 @@ import os from 'os';
 import sharp from 'sharp';
 import { Document, Packer, Paragraph, ImageRun } from 'docx';
 import pptxgen from 'pptxgenjs';
+import { createClient } from '@supabase/supabase-js';
+import jwt from 'jsonwebtoken';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -17,6 +19,31 @@ const CONVERTED_DIR = path.resolve('converted');
 const DOCUMENT_FORMATS = ['pdf', 'docx', 'doc', 'pptx', 'ppt'];
 const IMAGE_FORMATS = ['png', 'jpg', 'jpeg'];
 const ALLOWED_FORMATS = [...DOCUMENT_FORMATS, ...IMAGE_FORMATS];
+
+// --- Supabase (service role client — bypasses RLS, used only server-side) ---
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
+
+// Verifies the Supabase access token the Flutter app sends and attaches
+// the user id to the request. Runs before /convert does anything else.
+function requireUser(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing Authorization header' });
+  }
+  try {
+    const payload = jwt.verify(authHeader.slice(7), SUPABASE_JWT_SECRET, {
+      audience: 'authenticated',
+    });
+    req.userId = payload.sub;
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
 
 // What each source extension can actually convert to.
 //
@@ -127,7 +154,7 @@ app.get('/debug/mem', (req, res) => {
   });
 });
 
-app.post('/convert', upload.single('file'), async (req, res) => {
+app.post('/convert', upload.single('file'), requireUser, async (req, res) => {
   const inputFile = req.file;
   const targetFormat = req.body.to?.toLowerCase();
 
@@ -148,6 +175,23 @@ app.post('/convert', upload.single('file'), async (req, res) => {
       error: `Cannot convert ${inputExt} to ${targetFormat}`,
       supportedTargets: validTargets,
     });
+  }
+
+  // --- Usage check: verifies the plan/limit and atomically increments
+  // the counter before doing any conversion work. ---
+  const { data: allowed, error: usageError } = await supabase.rpc(
+    'increment_usage_if_allowed',
+    { p_user_id: req.userId }
+  );
+
+  if (usageError) {
+    console.error('Usage check failed:', usageError.message);
+    fs.unlink(inputPath, () => {});
+    return res.status(500).json({ error: 'Usage check failed' });
+  }
+  if (!allowed) {
+    fs.unlink(inputPath, () => {});
+    return res.status(403).json({ error: 'Monthly conversion limit reached', code: 'LIMIT_REACHED' });
   }
 
   const isImageToImage = IMAGE_FORMATS.includes(inputExt) && IMAGE_FORMATS.includes(targetFormat);
