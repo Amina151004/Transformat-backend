@@ -8,6 +8,7 @@ import sharp from 'sharp';
 import { Document, Packer, Paragraph, ImageRun } from 'docx';
 import pptxgen from 'pptxgenjs';
 import { createClient } from '@supabase/supabase-js';
+import ws from 'ws';
 import jwt from 'jsonwebtoken';
 
 const app = express();
@@ -23,7 +24,8 @@ const ALLOWED_FORMATS = [...DOCUMENT_FORMATS, ...IMAGE_FORMATS];
 // --- Supabase (service role client — bypasses RLS, used only server-side) ---
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  { realtime: { transport: ws } }
 );
 const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
 
