@@ -9,7 +9,7 @@ import { Document, Packer, Paragraph, ImageRun } from 'docx';
 import pptxgen from 'pptxgenjs';
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
-import jwt from 'jsonwebtoken';
+
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -31,20 +31,20 @@ const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
 
 // Verifies the Supabase access token the Flutter app sends and attaches
 // the user id to the request. Runs before /convert does anything else.
-function requireUser(req, res, next) {
+async function requireUser(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Missing Authorization header' });
   }
-  try {
-    const payload = jwt.verify(authHeader.slice(7), SUPABASE_JWT_SECRET, {
-      audience: 'authenticated',
-    });
-    req.userId = payload.sub;
-    next();
-  } catch {
+  const token = authHeader.slice(7);
+
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
+
+  req.userId = data.user.id;
+  next();
 }
 
 // What each source extension can actually convert to.
