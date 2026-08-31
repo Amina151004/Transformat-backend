@@ -9,6 +9,7 @@ import { Document, Packer, Paragraph, ImageRun } from 'docx';
 import pptxgen from 'pptxgenjs';
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
+import Stripe from 'stripe';
 
 
 const app = express();
@@ -27,7 +28,7 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY,
   { realtime: { transport: ws } }
 );
-const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // Verifies the Supabase access token the Flutter app sends and attaches
 // the user id to the request. Runs before /convert does anything else.
@@ -196,6 +197,8 @@ app.post('/convert', upload.single('file'), requireUser, async (req, res) => {
     return res.status(403).json({ error: 'Monthly conversion limit reached', code: 'LIMIT_REACHED' });
   }
 
+
+
   const isImageToImage = IMAGE_FORMATS.includes(inputExt) && IMAGE_FORMATS.includes(targetFormat);
   const isImageToDocx = IMAGE_FORMATS.includes(inputExt) && ['docx', 'doc'].includes(targetFormat);
   const isImageToPptx = IMAGE_FORMATS.includes(inputExt) && ['pptx', 'ppt'].includes(targetFormat);
@@ -319,6 +322,87 @@ app.post('/convert', upload.single('file'), requireUser, async (req, res) => {
       fs.unlink(outputPath, () => {});
     });
   });
+});
+
+// Creates a Stripe Checkout session for the logged-in user and returns its URL.
+app.post('/create-checkout-session', express.json(), requireUser, async (req, res) => {
+  try {
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('stripe_customer_id')
+      .eq('id', req.userId)
+      .single();
+
+    if (profileError) throw profileError;
+
+    let customerId = profile.stripe_customer_id;
+
+    // First-time upgrader: create a Stripe customer and remember it.
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        metadata: { supabase_user_id: req.userId },
+      });
+      customerId = customer.id;
+
+      await supabase
+        .from('profiles')
+        .update({ stripe_customer_id: customerId })
+        .eq('id', req.userId);
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer: customerId,
+      line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
+      success_url: 'https://transformat-backend.onrender.com/checkout-success',
+      cancel_url: 'https://transformat-backend.onrender.com/checkout-cancel',
+      metadata: { supabase_user_id: req.userId },
+    });
+
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error('Checkout session creation failed:', err.message);
+    res.status(500).json({ error: 'Could not start checkout' });
+  }
+});
+
+// Stripe calls this when a payment or subscription event happens.
+// express.raw is required here (not express.json) — Stripe's signature
+// check needs the exact raw request body, not a parsed/re-serialized one.
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const signature = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, signature, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const userId = session.metadata?.supabase_user_id;
+    if (userId) {
+      await supabase.from('profiles').update({ plan: 'pro' }).eq('id', userId);
+    }
+  }
+
+  if (event.type === 'customer.subscription.deleted' || event.type === 'customer.subscription.updated') {
+    const subscription = event.data.object;
+    if (['canceled', 'unpaid', 'incomplete_expired'].includes(subscription.status)) {
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('id')
+        .eq('stripe_customer_id', subscription.customer)
+        .single();
+      if (profile) {
+        await supabase.from('profiles').update({ plan: 'free' }).eq('id', profile.id);
+      }
+    }
+  }
+
+  res.json({ received: true });
 });
 
 app.listen(PORT, () => {
