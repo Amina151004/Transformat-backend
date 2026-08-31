@@ -366,6 +366,31 @@ app.post('/create-checkout-session', express.json(), requireUser, async (req, re
   }
 });
 
+// Keeps profiles.plan and profiles.pro_expires_at in sync with Stripe's
+// view of the subscription, whatever triggered the event.
+async function syncSubscriptionToProfile(subscription) {
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('id')
+    .eq('stripe_customer_id', subscription.customer)
+    .single();
+
+  if (!profile) return;
+
+  const isActive = ['active', 'trialing'].includes(subscription.status);
+  const expiresAt = subscription.current_period_end
+    ? new Date(subscription.current_period_end * 1000).toISOString()
+    : null;
+
+  await supabase
+    .from('profiles')
+    .update({
+      plan: isActive ? 'pro' : 'free',
+      pro_expires_at: isActive ? expiresAt : null,
+    })
+    .eq('id', profile.id);
+}
+
 // Stripe calls this when a payment or subscription event happens.
 // express.raw is required here (not express.json) — Stripe's signature
 // check needs the exact raw request body, not a parsed/re-serialized one.
@@ -382,24 +407,14 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
 
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
-    const userId = session.metadata?.supabase_user_id;
-    if (userId) {
-      await supabase.from('profiles').update({ plan: 'pro' }).eq('id', userId);
+    if (session.subscription) {
+      const subscription = await stripe.subscriptions.retrieve(session.subscription);
+      await syncSubscriptionToProfile(subscription);
     }
   }
 
-  if (event.type === 'customer.subscription.deleted' || event.type === 'customer.subscription.updated') {
-    const subscription = event.data.object;
-    if (['canceled', 'unpaid', 'incomplete_expired'].includes(subscription.status)) {
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('id')
-        .eq('stripe_customer_id', subscription.customer)
-        .single();
-      if (profile) {
-        await supabase.from('profiles').update({ plan: 'free' }).eq('id', profile.id);
-      }
-    }
+  if (event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
+    await syncSubscriptionToProfile(event.data.object);
   }
 
   res.json({ received: true });
