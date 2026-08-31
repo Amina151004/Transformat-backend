@@ -323,6 +323,19 @@ app.post('/convert', upload.single('file'), requireUser, async (req, res) => {
     });
   });
 });
+app.get('/checkout-success', (req, res) => {
+  res.send(
+    '<html><body style="font-family:sans-serif;text-align:center;padding-top:60px;">' +
+    '<h2>Payment successful 🎉</h2><p>You can return to the app now.</p></body></html>'
+  );
+});
+
+app.get('/checkout-cancel', (req, res) => {
+  res.send(
+    '<html><body style="font-family:sans-serif;text-align:center;padding-top:60px;">' +
+    '<h2>Checkout canceled</h2><p>You can return to the app.</p></body></html>'
+  );
+});
 
 // Creates a Stripe Checkout session for the logged-in user and returns its URL.
 app.post('/create-checkout-session', express.json(), requireUser, async (req, res) => {
