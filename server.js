@@ -379,6 +379,49 @@ app.post('/create-checkout-session', express.json(), requireUser, async (req, re
   }
 });
 
+// POST /cancel-subscription
+// Sets the user's active subscription to cancel at the end of the
+// current billing period, rather than cancelling immediately -- they
+// keep Pro access through what they already paid for. The webhook
+// handler below already listens for 'customer.subscription.updated'
+// and 'customer.subscription.deleted' and calls
+// syncSubscriptionToProfile, so profiles.plan flips to 'free' on its
+// own once the period actually ends. No extra sync logic is needed here.
+app.post('/cancel-subscription', express.json(), requireUser, async (req, res) => {
+  try {
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('stripe_customer_id')
+      .eq('id', req.userId)
+      .single();
+
+    if (profileError) throw profileError;
+    if (!profile?.stripe_customer_id) {
+      return res.status(400).json({ error: 'No active subscription found' });
+    }
+
+    const subscriptions = await stripe.subscriptions.list({
+      customer: profile.stripe_customer_id,
+      status: 'active',
+      limit: 1,
+    });
+
+    const subscription = subscriptions.data[0];
+    if (!subscription) {
+      return res.status(400).json({ error: 'No active subscription found' });
+    }
+
+    await stripe.subscriptions.update(subscription.id, {
+      cancel_at_period_end: true,
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Subscription cancellation failed:', err.message);
+    res.status(500).json({ error: 'Could not cancel subscription' });
+  }
+});
+
 // DELETE /account
 // Permanently deletes the caller's account. Best-effort cancels any
 // active Stripe subscription first so they don't keep getting billed
