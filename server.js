@@ -22,6 +22,13 @@ const DOCUMENT_FORMATS = ['pdf', 'docx', 'doc', 'pptx', 'ppt'];
 const IMAGE_FORMATS = ['png', 'jpg', 'jpeg'];
 const ALLOWED_FORMATS = [...DOCUMENT_FORMATS, ...IMAGE_FORMATS];
 
+// Render's free plan gives the whole process 512MB of RAM. LibreOffice
+// and sharp can use several times an input file's size in memory during
+// conversion, so this cap is deliberately conservative -- it's not about
+// storage (nothing is persisted; see UPLOAD_DIR/CONVERTED_DIR cleanup
+// below), it's about not OOM-killing the dyno on a single request.
+const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024; // 20MB
+
 // --- Supabase (service role client — bypasses RLS, used only server-side) ---
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -82,7 +89,10 @@ const storage = multer.diskStorage({
     cb(null, uniqueName);
   },
 });
-const upload = multer({ storage });
+const upload = multer({
+  storage,
+  limits: { fileSize: MAX_FILE_SIZE_BYTES },
+});
 
 // ---------------------------------------------------------------------
 // Conversion helpers
@@ -157,7 +167,24 @@ app.get('/debug/mem', (req, res) => {
   });
 });
 
-app.post('/convert', upload.single('file'), requireUser, async (req, res) => {
+// multer runs here manually (instead of inline in the route args) so we
+// can catch LIMIT_FILE_SIZE and respond with a clean 413 JSON error
+// instead of letting multer's raw error propagate as a 500.
+app.post('/convert', (req, res, next) => {
+  upload.single('file')(req, res, (err) => {
+    if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({
+        error: `File too large. Max size is ${MAX_FILE_SIZE_BYTES / (1024 * 1024)}MB`,
+        code: 'FILE_TOO_LARGE',
+      });
+    }
+    if (err) {
+      console.error('Upload error:', err.message);
+      return res.status(400).json({ error: 'Upload failed' });
+    }
+    next();
+  });
+}, requireUser, async (req, res) => {
   const inputFile = req.file;
   const targetFormat = req.body.to?.toLowerCase();
 
