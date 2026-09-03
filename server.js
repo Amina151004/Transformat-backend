@@ -11,10 +11,17 @@ import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
 import Stripe from 'stripe';
 import { fileTypeFromFile } from 'file-type';
+import rateLimit from 'express-rate-limit';
 
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Render sits behind a proxy (like most PaaS), so Express needs this to
+// read the real client IP from X-Forwarded-For instead of seeing every
+// request as coming from the proxy itself -- required for
+// express-rate-limit to key by IP correctly.
+app.set('trust proxy', 1);
 
 const UPLOAD_DIR = path.resolve('uploads');
 const CONVERTED_DIR = path.resolve('converted');
@@ -61,6 +68,33 @@ function sanitizeExtension(originalName) {
   const rawExt = path.extname(originalName || '').replace('.', '').toLowerCase();
   return SAFE_EXT_REGEX.test(rawExt) ? rawExt : '';
 }
+
+// General baseline across the whole API -- catches abuse of the
+// lighter-weight routes (checkout, account deletion, etc). Generous
+// since it's just a backstop, not the primary defense.
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  limit: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' },
+});
+
+// /convert specifically spins up LibreOffice or a Python subprocess --
+// by far the most expensive thing this server does, and on Render's
+// free 512MB instance a burst of these could OOM the whole process.
+// This is deliberately stricter than increment_usage_if_allowed's
+// monthly quota: that guards against long-term overuse, this guards
+// against short bursts hammering the machine within seconds/minutes,
+// which the monthly counter alone wouldn't catch in time. Keyed by IP
+// since it runs before requireUser resolves a user id.
+const convertLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many conversion requests. Please wait a bit and try again.', code: 'RATE_LIMITED' },
+});
 
 // --- Supabase (service role client — bypasses RLS, used only server-side) ---
 const supabase = createClient(
@@ -207,9 +241,14 @@ async function imageToPptx(inputPath, outputPath) {
 // Routes
 // ---------------------------------------------------------------------
 
+// Health checks (e.g. from Render itself, or uptime monitors) can be
+// frequent -- skip the general limiter for it so monitoring never gets
+// throttled.
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
+
+app.use(generalLimiter);
 
 app.get('/debug/mem', (req, res) => {
   const used = process.memoryUsage();
@@ -221,10 +260,10 @@ app.get('/debug/mem', (req, res) => {
   });
 });
 
-// multer runs here manually (instead of inline in the route args) so we
-// can catch LIMIT_FILE_SIZE and respond with a clean 413 JSON error
-// instead of letting multer's raw error propagate as a 500.
-app.post('/convert', (req, res, next) => {
+// convertLimiter runs before multer so an abusive burst gets rejected
+// before any upload bytes are even accepted, not after paying the cost
+// of receiving a large file.
+app.post('/convert', convertLimiter, (req, res, next) => {
   upload.single('file')(req, res, (err) => {
     if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
       return res.status(413).json({
@@ -605,6 +644,9 @@ async function syncSubscriptionToProfile(subscription) {
 // Stripe calls this when a payment or subscription event happens.
 // express.raw is required here (not express.json) — Stripe's signature
 // check needs the exact raw request body, not a parsed/re-serialized one.
+// Placed after app.use(generalLimiter) in file order, but Stripe retries
+// failed webhooks on its own schedule -- if you see missed events in
+// Stripe's dashboard under load, exclude this route from the limiter too.
 app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const signature = req.headers['stripe-signature'];
   let event;
@@ -633,4 +675,4 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
 
 app.listen(PORT, () => {
   console.log(`Converter backend running on http://localhost:${PORT}`);
-}); 
+});
