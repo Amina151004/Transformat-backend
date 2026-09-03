@@ -10,6 +10,7 @@ import pptxgen from 'pptxgenjs';
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
 import Stripe from 'stripe';
+import { fileTypeFromFile } from 'file-type';
 
 
 const app = express();
@@ -28,6 +29,25 @@ const ALLOWED_FORMATS = [...DOCUMENT_FORMATS, ...IMAGE_FORMATS];
 // storage (nothing is persisted; see UPLOAD_DIR/CONVERTED_DIR cleanup
 // below), it's about not OOM-killing the dyno on a single request.
 const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024; // 20MB
+
+// Maps our accepted extensions to the real MIME type file-type should
+// detect from the file's actual bytes -- never trust the extension or
+// the client-supplied Content-Type, both are trivially spoofable.
+// Legacy .doc/.ppt are OLE compound files (not modern zip-based Office
+// formats), and file-type reports those as 'application/x-cfb' rather
+// than anything doc/ppt-specific, so we accept that generic signature
+// for them -- it still rules out someone renaming an .exe or .pdf to
+// .doc, just not a renamed .doc to .ppt (both are OLE-based).
+const EXPECTED_MIME_BY_EXT = {
+  pdf: ['application/pdf'],
+  docx: ['application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+  doc: ['application/x-cfb'],
+  pptx: ['application/vnd.openxmlformats-officedocument.presentationml.presentation'],
+  ppt: ['application/x-cfb'],
+  png: ['image/png'],
+  jpg: ['image/jpeg'],
+  jpeg: ['image/jpeg'],
+};
 
 // --- Supabase (service role client — bypasses RLS, used only server-side) ---
 const supabase = createClient(
@@ -79,6 +99,22 @@ function getValidTargets(sourceExt) {
     return [...IMAGE_FORMATS.filter((f) => f !== ext), 'pdf', 'docx', 'pptx'];
   }
   return [];
+}
+
+// Reads the file's actual magic bytes and checks them against what its
+// extension claims to be. Returns true if they match (or if the
+// extension has no signature to check, which shouldn't happen given
+// ALLOWED_FORMATS, but fails closed just in case). This protects
+// against someone renaming an arbitrary file (e.g. an executable) to
+// look like an accepted extension before uploading it.
+async function verifyMimeMatchesExtension(filePath, ext) {
+  const expected = EXPECTED_MIME_BY_EXT[ext];
+  if (!expected) return false;
+
+  const detected = await fileTypeFromFile(filePath);
+  if (!detected) return false; // couldn't sniff a signature at all -- reject
+
+  return expected.includes(detected.mime);
 }
 
 const storage = multer.diskStorage({
@@ -205,6 +241,24 @@ app.post('/convert', (req, res, next) => {
       error: `Cannot convert ${inputExt} to ${targetFormat}`,
       supportedTargets: validTargets,
     });
+  }
+
+  // --- MIME check: the extension says one thing, verify the actual
+  // file bytes agree, before we burn a usage credit or hand this to
+  // LibreOffice. ---
+  try {
+    const mimeOk = await verifyMimeMatchesExtension(inputPath, inputExt);
+    if (!mimeOk) {
+      fs.unlink(inputPath, () => {});
+      return res.status(400).json({
+        error: `File content does not match its extension (.${inputExt})`,
+        code: 'MIME_MISMATCH',
+      });
+    }
+  } catch (err) {
+    console.error('MIME check failed:', err.message);
+    fs.unlink(inputPath, () => {});
+    return res.status(400).json({ error: 'Could not verify file type' });
   }
 
   // --- Usage check: verifies the plan/limit and atomically increments
