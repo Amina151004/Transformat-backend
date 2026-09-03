@@ -49,6 +49,19 @@ const EXPECTED_MIME_BY_EXT = {
   jpeg: ['image/jpeg'],
 };
 
+// Only allow simple alphanumeric extensions. Anything else -- path
+// traversal attempts, shell metacharacters, null bytes, unicode
+// tricks, multiple dots -- is stripped rather than trusted, since
+// this string becomes part of a filename that later gets
+// interpolated into a shell command via exec() (LibreOffice,
+// pdf2docx). Never build a shell command from raw user input.
+const SAFE_EXT_REGEX = /^[a-zA-Z0-9]+$/;
+
+function sanitizeExtension(originalName) {
+  const rawExt = path.extname(originalName || '').replace('.', '').toLowerCase();
+  return SAFE_EXT_REGEX.test(rawExt) ? rawExt : '';
+}
+
 // --- Supabase (service role client — bypasses RLS, used only server-side) ---
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -120,8 +133,13 @@ async function verifyMimeMatchesExtension(filePath, ext) {
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+    // Never trust file.originalname directly -- it's fully attacker
+    // controlled and this filename later gets interpolated into shell
+    // commands (LibreOffice/pdf2docx via exec()). Only the sanitized
+    // extension survives; the base name is always our own
+    // Date.now()-random string, never anything from the client.
+    const ext = sanitizeExtension(file.originalname);
+    const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext ? '.' + ext : ''}`;
     cb(null, uniqueName);
   },
 });
@@ -374,7 +392,11 @@ app.post('/convert', (req, res, next) => {
   }
 
   // --- Everything else (documents, doc->pdf, doc/image->pdf, pdf->image): LibreOffice ---
-  const command = `libreoffice --headless --norestore -env:UserInstallation=file:///tmp/lo_profile --convert-to ${targetFormat} --outdir ${CONVERTED_DIR} ${inputPath}`;
+  // Paths/format are quoted even though they're already sanitized
+  // (server-generated filenames, whitelist-checked targetFormat) --
+  // defense in depth against ever building a shell command from
+  // unsanitized input in the future.
+  const command = `libreoffice --headless --norestore -env:UserInstallation=file:///tmp/lo_profile --convert-to "${targetFormat}" --outdir "${CONVERTED_DIR}" "${inputPath}"`;
 
   exec(command, { timeout: 60000 }, (error, stdout, stderr) => {
     console.log('Command:', command);
