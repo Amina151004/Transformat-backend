@@ -479,55 +479,6 @@ app.get('/checkout-cancel', (req, res) => {
   );
 });
 
-// GET /reset-password
-// This is what the "forgot password" email link points to -- NOT a
-// custom URL scheme directly, because most email clients strip or
-// refuse to render non-http(s) links, so Supabase's redirectTo needs
-// to be a normal https URL.
-//
-// Supabase appends the recovery token to the URL fragment (the part
-// after #), e.g. .../reset-password#access_token=...&type=recovery.
-// Fragments are never sent to the server -- only the browser sees
-// them -- so this page has to be a tiny bit of client-side JS that
-// reads window.location.hash and forwards it into the app's own
-// custom scheme, which is what actually reopens Transformat.
-//
-// You'll need to:
-//   1. Register a custom URL scheme for the app (e.g. transformat://)
-//      in AndroidManifest.xml and Info.plist.
-//   2. Add a deep link listener in Flutter (e.g. via the app_links
-//      package) that catches transformat://reset-password#... and
-//      hands the fragment to Supabase to complete the recovery.
-//   3. Add this exact page's URL to Supabase's Auth -> URL
-//      Configuration -> Redirect URLs allowlist, and pass it as
-//      `redirectTo` in AuthService.sendPasswordResetEmail().
-app.get('/reset-password', (req, res) => {
-  res.send(`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Resetting your password</title>
-</head>
-<body style="font-family:sans-serif;text-align:center;padding-top:60px;">
-  <h2>Opening Transformat...</h2>
-  <p>If nothing happens, make sure the Transformat app is installed.</p>
-  <p><a id="fallback-link" href="#">Tap here to open the app</a></p>
-  <script>
-    // The recovery token lives in the fragment (#...), which never
-    // reaches the server -- only this in-browser script can read it.
-    var hash = window.location.hash; // includes the leading '#'
-    var deepLink = 'transformat://reset-password' + hash;
-
-    document.getElementById('fallback-link').href = deepLink;
-
-    // Attempt an automatic redirect; the visible link above is the
-    // fallback for browsers that block auto-redirects to custom schemes.
-    window.location.href = deepLink;
-  </script>
-</body>
-</html>`);
-});
-
 // Creates a Stripe Checkout session for the logged-in user and returns its URL.
 app.post('/create-checkout-session', express.json(), requireUser, async (req, res) => {
   try {
