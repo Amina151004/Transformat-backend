@@ -613,6 +613,37 @@ app.post('/cancel-subscription', express.json(), requireUser, async (req, res) =
   }
 });
 
+// POST /billing-portal
+// Returns a URL to Stripe's hosted Billing Portal, where the user can
+// update their card, view invoices, etc. This is the actual fix for a
+// failed payment -- pairs with the payment_failed flag on profiles:
+// the app shows a warning when it's true, and this is where the
+// "Update payment method" button sends them.
+app.post('/billing-portal', express.json(), requireUser, async (req, res) => {
+  try {
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('stripe_customer_id')
+      .eq('id', req.userId)
+      .single();
+
+    if (profileError) throw profileError;
+    if (!profile?.stripe_customer_id) {
+      return res.status(400).json({ error: 'No billing account found' });
+    }
+
+    const portalSession = await stripe.billingPortal.sessions.create({
+      customer: profile.stripe_customer_id,
+      return_url: 'https://transformat-backend.onrender.com/checkout-success',
+    });
+
+    res.json({ url: portalSession.url });
+  } catch (err) {
+    console.error('Billing portal session creation failed:', err.message);
+    res.status(500).json({ error: 'Could not open billing portal' });
+  }
+});
+
 // DELETE /account
 // Permanently deletes the caller's account. Best-effort cancels any
 // active Stripe subscription first so they don't keep getting billed
@@ -690,6 +721,25 @@ async function syncSubscriptionToProfile(subscription) {
     .eq('id', profile.id);
 }
 
+// Flips profiles.payment_failed to true/false based on invoice events,
+// so the app can show (or clear) a "update your payment method"
+// warning. Looked up by customer id, same pattern as
+// syncSubscriptionToProfile.
+async function setPaymentFailed(customerId, failed) {
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('id')
+    .eq('stripe_customer_id', customerId)
+    .single();
+
+  if (!profile) return;
+
+  await supabase
+    .from('profiles')
+    .update({ payment_failed: failed })
+    .eq('id', profile.id);
+}
+
 // Stripe calls this when a payment or subscription event happens.
 // express.raw is required here (not express.json) — Stripe's signature
 // check needs the exact raw request body, not a parsed/re-serialized one.
@@ -751,13 +801,23 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
       // the card automatically, and a subsequent
       // customer.subscription.updated event will flip profiles.plan
       // to 'free' once the subscription actually lapses to
-      // past_due/unpaid -- so no state change is needed here. This is
-      // deliberately just visibility for now; user-facing messaging
-      // (e.g. an in-app banner or email) is a separate piece of work.
+      // past_due/unpaid. payment_failed is set immediately though, so
+      // the app can warn the user well before that happens -- waiting
+      // for the plan to actually lapse would be too late to help them
+      // avoid it.
       const invoice = event.data.object;
       console.warn(
         `Payment failed for customer ${invoice.customer}, invoice ${invoice.id}`
       );
+      await setPaymentFailed(invoice.customer, true);
+    }
+
+    if (event.type === 'invoice.payment_succeeded') {
+      // Clears the warning once a payment actually goes through --
+      // covers both "fixed their card and Stripe's retry succeeded"
+      // and the normal case of every renewal that just works.
+      const invoice = event.data.object;
+      await setPaymentFailed(invoice.customer, false);
     }
 
     res.json({ received: true });
