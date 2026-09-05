@@ -26,6 +26,49 @@ app.set('trust proxy', 1);
 const UPLOAD_DIR = path.resolve('uploads');
 const CONVERTED_DIR = path.resolve('converted');
 
+// Safety net on top of the explicit fs.unlink() calls throughout
+// /convert. Those cover every failure path we can actually catch, but
+// some things slip past any try/catch entirely -- a Multer upload
+// rejected for exceeding MAX_FILE_SIZE_BYTES can leave a partial file
+// on disk with no req.file reference to clean it up by, and a server
+// crash or client disconnect mid-request leaves whatever existed at
+// that instant. This sweep periodically deletes anything older than
+// STALE_FILE_MAX_AGE_MS from both directories, regardless of how it
+// got there or why it wasn't cleaned up already.
+const STALE_FILE_MAX_AGE_MS = 10 * 60 * 1000; // 10 minutes
+const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // run every 5 minutes
+
+async function cleanupStaleFiles() {
+  for (const dir of [UPLOAD_DIR, CONVERTED_DIR]) {
+    let entries;
+    try {
+      entries = await fs.promises.readdir(dir);
+    } catch (err) {
+      console.error(`Cleanup sweep: could not read ${dir}:`, err.message);
+      continue;
+    }
+
+    for (const entry of entries) {
+      const filePath = path.join(dir, entry);
+      try {
+        const stats = await fs.promises.stat(filePath);
+        const age = Date.now() - stats.mtimeMs;
+        if (age > STALE_FILE_MAX_AGE_MS) {
+          await fs.promises.unlink(filePath);
+          console.warn(`Cleanup sweep: removed stale file ${filePath} (age ${Math.round(age / 1000)}s)`);
+        }
+      } catch (err) {
+        // ENOENT is expected if the file was already deleted by the
+        // normal cleanup path between readdir and this stat/unlink --
+        // that's a race, not a real error. Anything else gets logged.
+        if (err.code !== 'ENOENT') {
+          console.error(`Cleanup sweep: failed on ${filePath}:`, err.message);
+        }
+      }
+    }
+  }
+}
+
 const DOCUMENT_FORMATS = ['pdf', 'docx', 'doc', 'pptx', 'ppt'];
 const IMAGE_FORMATS = ['png', 'jpg', 'jpeg'];
 const ALLOWED_FORMATS = [...DOCUMENT_FORMATS, ...IMAGE_FORMATS];
@@ -285,6 +328,7 @@ app.post('/convert', convertLimiter, (req, res, next) => {
     return res.status(400).json({ error: 'No file uploaded (field name must be "file")' });
   }
   if (!targetFormat || !ALLOWED_FORMATS.includes(targetFormat)) {
+    fs.unlink(inputFile.path, () => {});
     return res.status(400).json({ error: `"to" must be one of: ${ALLOWED_FORMATS.join(', ')}` });
   }
 
@@ -357,6 +401,9 @@ app.post('/convert', convertLimiter, (req, res, next) => {
     } catch (err) {
       console.error('sharp conversion failed:', err.message);
       fs.unlink(inputPath, () => {});
+      // sharp can write a partial/corrupt file before throwing, so
+      // attempt cleanup here too rather than only on the success path.
+      fs.unlink(outputPath, () => {});
       return res.status(500).json({ error: 'Image conversion failed' });
     }
   }
@@ -374,6 +421,9 @@ app.post('/convert', convertLimiter, (req, res, next) => {
     } catch (err) {
       console.error('image->docx conversion failed:', err.message);
       fs.unlink(inputPath, () => {});
+      // Packer.toBuffer/writeFileSync can leave a partial .docx behind
+      // if it fails midway, so clean that up too, not just the input.
+      fs.unlink(outputPath, () => {});
       return res.status(500).json({ error: 'Image to DOCX conversion failed' });
     }
   }
@@ -391,6 +441,9 @@ app.post('/convert', convertLimiter, (req, res, next) => {
     } catch (err) {
       console.error('image->pptx conversion failed:', err.message);
       fs.unlink(inputPath, () => {});
+      // pres.writeFile can leave a partial .pptx behind if it fails
+      // midway, so clean that up too, not just the input.
+      fs.unlink(outputPath, () => {});
       return res.status(500).json({ error: 'Image to PPTX conversion failed' });
     }
   }
@@ -411,6 +464,9 @@ app.post('/convert', convertLimiter, (req, res, next) => {
       if (error) {
         console.error('pdf2docx conversion failed:', error.message);
         fs.unlink(inputPath, () => {});
+        // The Python script can write a partial .docx before crashing,
+        // so attempt cleanup here too rather than only on success.
+        fs.unlink(outputPath, () => {});
         return res.status(500).json({ error: 'PDF to DOCX conversion failed' });
       }
 
@@ -445,6 +501,17 @@ app.post('/convert', convertLimiter, (req, res, next) => {
     if (error) {
       console.error('Conversion exec error:', error.message);
       fs.unlink(inputPath, () => {});
+      // LibreOffice can write a partial output file before failing
+      // (e.g. hitting the timeout mid-conversion), so attempt cleanup
+      // here too rather than only on the success path. The exact
+      // output filename/extension isn't known this early in some
+      // failure cases, but outFmt/outputPath below are computed from
+      // inputs already validated earlier in the route, so it's safe
+      // to compute them here as well for this cleanup attempt.
+      const outFmtOnError = targetFormat === 'jpg' ? 'jpg' : targetFormat;
+      const inputBaseNameOnError = path.basename(inputPath, path.extname(inputPath));
+      const outputPathOnError = path.join(CONVERTED_DIR, `${inputBaseNameOnError}.${outFmtOnError}`);
+      fs.unlink(outputPathOnError, () => {});
       return res.status(500).json({ error: 'Conversion failed' });
     }
 
@@ -780,4 +847,10 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
 
 app.listen(PORT, () => {
   console.log(`Converter backend running on http://localhost:${PORT}`);
+
+  // Run once immediately on startup -- catches anything left behind
+  // by a crash or redeploy before the first interval tick, then keep
+  // sweeping periodically for the lifetime of the process.
+  cleanupStaleFiles();
+  setInterval(cleanupStaleFiles, CLEANUP_INTERVAL_MS);
 });
