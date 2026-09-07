@@ -151,7 +151,22 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
 
     const pyCommand = `/opt/pdf2docx-venv/bin/python3 convert_pdf.py "${inputPath}" "${outputPath}"`;
 
-    exec(pyCommand, { timeout: 120000 }, (error, stdout, stderr) => {
+    // Same abandoned-request problem as the LibreOffice block below:
+    // without this, a client that disconnects mid-conversion leaves
+    // the Python sidecar running to completion for nothing. `child`
+    // is the spawned process handle returned by exec(); req.on('close')
+    // fires on disconnect (and also on a normal finish, which
+    // res.writableEnded distinguishes so we don't kill an
+    // already-completed conversion).
+    let clientClosed = false;
+    const child = exec(pyCommand, { timeout: 120000 }, (error, stdout, stderr) => {
+      if (clientClosed) {
+        // Client is gone -- just clean up the files, res is dead.
+        fs.unlink(inputPath, () => {});
+        fs.unlink(outputPath, () => {});
+        return;
+      }
+
       console.log('PDF->DOCX command:', pyCommand);
       console.log('stdout:', stdout);
       console.log('stderr:', stderr);
@@ -178,6 +193,14 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
         fs.unlink(outputPath, () => {});
       });
     });
+
+    req.on('close', () => {
+      if (!res.writableEnded) {
+        clientClosed = true;
+        child.kill('SIGTERM');
+      }
+    });
+
     return; // stop here, don't fall through to the LibreOffice block
   }
 
@@ -188,7 +211,22 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
   // unsanitized input in the future.
   const command = `libreoffice --headless --norestore -env:UserInstallation=file:///tmp/lo_profile --convert-to "${targetFormat}" --outdir "${CONVERTED_DIR}" "${inputPath}"`;
 
-  exec(command, { timeout: 60000 }, (error, stdout, stderr) => {
+  // Same pattern as the pdf2docx block above: kill the LibreOffice
+  // process if the client disconnects before conversion finishes,
+  // instead of letting it run to completion on an abandoned upload.
+  let clientClosed = false;
+  const child = exec(command, { timeout: 60000 }, (error, stdout, stderr) => {
+    const outFmt = targetFormat === 'jpg' ? 'jpg' : targetFormat;
+    const inputBaseName = path.basename(inputPath, path.extname(inputPath));
+    const outputPath = path.join(CONVERTED_DIR, `${inputBaseName}.${outFmt}`);
+
+    if (clientClosed) {
+      // Client is gone -- just clean up whatever got produced, res is dead.
+      fs.unlink(inputPath, () => {});
+      fs.unlink(outputPath, () => {});
+      return;
+    }
+
     console.log('Command:', command);
     console.log('stdout:', stdout);
     console.log('stderr:', stderr);
@@ -198,22 +236,10 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
       fs.unlink(inputPath, () => {});
       // LibreOffice can write a partial output file before failing
       // (e.g. hitting the timeout mid-conversion), so attempt cleanup
-      // here too rather than only on the success path. The exact
-      // output filename/extension isn't known this early in some
-      // failure cases, but outFmt/outputPath below are computed from
-      // inputs already validated earlier in the route, so it's safe
-      // to compute them here as well for this cleanup attempt.
-      const outFmtOnError = targetFormat === 'jpg' ? 'jpg' : targetFormat;
-      const inputBaseNameOnError = path.basename(inputPath, path.extname(inputPath));
-      const outputPathOnError = path.join(CONVERTED_DIR, `${inputBaseNameOnError}.${outFmtOnError}`);
-      fs.unlink(outputPathOnError, () => {});
+      // here too rather than only on the success path.
+      fs.unlink(outputPath, () => {});
       return res.status(500).json({ error: 'Conversion failed' });
     }
-
-    const outFmt = targetFormat === 'jpg' ? 'jpg' : targetFormat;
-    const inputBaseName = path.basename(inputPath, path.extname(inputPath));
-    const outputFileName = `${inputBaseName}.${outFmt}`;
-    const outputPath = path.join(CONVERTED_DIR, outputFileName);
 
     if (!fs.existsSync(outputPath)) {
       console.error('Expected output at:', outputPath);
@@ -225,6 +251,13 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
       fs.unlink(inputPath, () => {});
       fs.unlink(outputPath, () => {});
     });
+  });
+
+  req.on('close', () => {
+    if (!res.writableEnded) {
+      clientClosed = true;
+      child.kill('SIGTERM');
+    }
   });
 });
 

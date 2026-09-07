@@ -20,10 +20,17 @@ const PORT = process.env.PORT || 3000;
 // express-rate-limit to key by IP correctly.
 app.set('trust proxy', 1);
 
-// /health is mounted before generalLimiter deliberately -- uptime
-// monitors and Render's own health checks can be frequent and should
-// never get throttled.
+// /health and /webhooks/stripe are both mounted before generalLimiter
+// deliberately. /health because uptime monitors and Render's own
+// health checks can be frequent and should never get throttled.
+// /webhooks/stripe because Stripe retries failed webhooks from a
+// shared pool of IPs -- under load, those retries could otherwise
+// collide with the general rate limit and get dropped, leaving
+// profiles.plan stale with no easy way to notice. The route itself
+// has no other exposure from skipping the limiter, since it already
+// verifies Stripe's signature before doing anything else.
 app.use(healthRoutes);
+app.use(webhookRoutes);
 
 app.use(generalLimiter);
 
@@ -34,7 +41,6 @@ app.use(debugRoutes);
 app.use(convertRoutes);
 app.use(billingRoutes);
 app.use(accountRoutes);
-app.use(webhookRoutes);
 
 app.listen(PORT, () => {
   console.log(`Converter backend running on http://localhost:${PORT}`);
