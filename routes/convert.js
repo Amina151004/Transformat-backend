@@ -102,6 +102,7 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
     try {
       await sharp(inputPath).toFormat(sharpFormat).toFile(outputPath);
       if (clientClosed) {
+        console.log('Client disconnected mid-conversion (image->image) - cleaned up immediately:', inputPath);
         fs.unlink(inputPath, () => {});
         fs.unlink(outputPath, () => {});
         return;
