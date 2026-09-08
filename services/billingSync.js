@@ -12,8 +12,17 @@ export async function syncSubscriptionToProfile(subscription) {
   if (!profile) return;
 
   const isActive = ['active', 'trialing'].includes(subscription.status);
-  const expiresAt = subscription.current_period_end
-    ? new Date(subscription.current_period_end * 1000).toISOString()
+
+  // As of Stripe's Basil API version (2025-03-31), current_period_end
+  // no longer lives on the subscription object itself -- it moved to
+  // each subscription item. Falling back to the old top-level field
+  // too in case this ever runs against an older API version.
+  const periodEndSeconds =
+    subscription.items?.data?.[0]?.current_period_end ??
+    subscription.current_period_end;
+
+  const expiresAt = periodEndSeconds
+    ? new Date(periodEndSeconds * 1000).toISOString()
     : null;
 
   await supabase

@@ -131,6 +131,7 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
     try {
       await imageToDocx(inputPath, outputPath);
       if (clientClosed) {
+        console.log('Client disconnected mid-conversion (image->docx) - cleaned up immediately:', inputPath);
         fs.unlink(inputPath, () => {});
         fs.unlink(outputPath, () => {});
         return;
@@ -159,6 +160,7 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
     try {
       await imageToPptx(inputPath, outputPath);
       if (clientClosed) {
+        console.log('Client disconnected mid-conversion (image->pptx) - cleaned up immediately:', inputPath);
         fs.unlink(inputPath, () => {});
         fs.unlink(outputPath, () => {});
         return;
@@ -199,6 +201,7 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
     const child = exec(pyCommand, { timeout: 120000 }, (error, stdout, stderr) => {
       if (pdfClientClosed) {
         // Client is gone -- just clean up the files, res is dead.
+        console.log('Client disconnected mid-conversion (pdf->docx) - cleaned up immediately:', inputPath);
         fs.unlink(inputPath, () => {});
         fs.unlink(outputPath, () => {});
         return;
@@ -259,6 +262,7 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
 
     if (loClientClosed) {
       // Client is gone -- just clean up whatever got produced, res is dead.
+      console.log('Client disconnected mid-conversion (libreoffice) - cleaned up immediately:', inputPath);
       fs.unlink(inputPath, () => {});
       fs.unlink(outputPath, () => {});
       return;
