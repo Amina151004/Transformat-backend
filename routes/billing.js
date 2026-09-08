@@ -2,6 +2,7 @@ import { Router } from 'express';
 import express from 'express';
 import { supabase, stripe } from '../lib/clients.js';
 import { requireUser } from '../middleware/requireUser.js';
+import { syncSubscriptionToProfile } from '../services/billingSync.js';
 
 const router = Router();
 
@@ -93,9 +94,15 @@ router.post('/cancel-subscription', express.json(), requireUser, async (req, res
       return res.status(400).json({ error: 'No active subscription found' });
     }
 
-    await stripe.subscriptions.update(subscription.id, {
+    const updatedSubscription = await stripe.subscriptions.update(subscription.id, {
       cancel_at_period_end: true,
     });
+
+    // Sync immediately rather than waiting on the async
+    // customer.subscription.updated webhook to land -- the webhook
+    // will also fire and re-sync the same data shortly after, which
+    // is harmless since this write is idempotent.
+    await syncSubscriptionToProfile(updatedSubscription);
 
     res.json({ ok: true });
   } catch (err) {
