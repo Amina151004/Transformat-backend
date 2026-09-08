@@ -81,6 +81,18 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
   const isImageToPptx = IMAGE_FORMATS.includes(inputExt) && ['pptx', 'ppt'].includes(targetFormat);
   const isPdfToWord = inputExt === 'pdf' && ['docx', 'doc'].includes(targetFormat);
 
+  // Sharp/docx/pptx conversions below can't be killed mid-flight the way
+  // exec()-based ones can, but if the client disconnects while we're
+  // awaiting them, we shouldn't try to write a response to a dead
+  // connection afterward -- that was leaving orphaned files for the
+  // periodic sweep to clean up minutes later instead of immediately.
+  let clientClosed = false;
+  if (isImageToImage || isImageToDocx || isImageToPptx) {
+    req.on('close', () => {
+      if (!res.writableEnded) clientClosed = true;
+    });
+  }
+
   // --- Image -> Image: handled directly with sharp, no LibreOffice needed ---
   if (isImageToImage) {
     const outputFileName = `${path.basename(inputPath, path.extname(inputPath))}.${targetFormat}`;
@@ -89,6 +101,11 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
 
     try {
       await sharp(inputPath).toFormat(sharpFormat).toFile(outputPath);
+      if (clientClosed) {
+        fs.unlink(inputPath, () => {});
+        fs.unlink(outputPath, () => {});
+        return;
+      }
       return res.download(outputPath, `converted.${targetFormat}`, () => {
         fs.unlink(inputPath, () => {});
         fs.unlink(outputPath, () => {});
@@ -99,7 +116,10 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
       // sharp can write a partial/corrupt file before throwing, so
       // attempt cleanup here too rather than only on the success path.
       fs.unlink(outputPath, () => {});
-      return res.status(500).json({ error: 'Image conversion failed' });
+      if (!clientClosed) {
+        return res.status(500).json({ error: 'Image conversion failed' });
+      }
+      return;
     }
   }
 
@@ -109,6 +129,11 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
     const outputPath = path.join(CONVERTED_DIR, `${inputBaseName}.docx`);
     try {
       await imageToDocx(inputPath, outputPath);
+      if (clientClosed) {
+        fs.unlink(inputPath, () => {});
+        fs.unlink(outputPath, () => {});
+        return;
+      }
       return res.download(outputPath, 'converted.docx', () => {
         fs.unlink(inputPath, () => {});
         fs.unlink(outputPath, () => {});
@@ -119,7 +144,10 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
       // Packer.toBuffer/writeFileSync can leave a partial .docx behind
       // if it fails midway, so clean that up too, not just the input.
       fs.unlink(outputPath, () => {});
-      return res.status(500).json({ error: 'Image to DOCX conversion failed' });
+      if (!clientClosed) {
+        return res.status(500).json({ error: 'Image to DOCX conversion failed' });
+      }
+      return;
     }
   }
 
@@ -129,6 +157,11 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
     const outputPath = path.join(CONVERTED_DIR, `${inputBaseName}.pptx`);
     try {
       await imageToPptx(inputPath, outputPath);
+      if (clientClosed) {
+        fs.unlink(inputPath, () => {});
+        fs.unlink(outputPath, () => {});
+        return;
+      }
       return res.download(outputPath, 'converted.pptx', () => {
         fs.unlink(inputPath, () => {});
         fs.unlink(outputPath, () => {});
@@ -139,7 +172,10 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
       // pres.writeFile can leave a partial .pptx behind if it fails
       // midway, so clean that up too, not just the input.
       fs.unlink(outputPath, () => {});
-      return res.status(500).json({ error: 'Image to PPTX conversion failed' });
+      if (!clientClosed) {
+        return res.status(500).json({ error: 'Image to PPTX conversion failed' });
+      }
+      return;
     }
   }
 
@@ -158,9 +194,9 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
     // fires on disconnect (and also on a normal finish, which
     // res.writableEnded distinguishes so we don't kill an
     // already-completed conversion).
-    let clientClosed = false;
+    let pdfClientClosed = false;
     const child = exec(pyCommand, { timeout: 120000 }, (error, stdout, stderr) => {
-      if (clientClosed) {
+      if (pdfClientClosed) {
         // Client is gone -- just clean up the files, res is dead.
         fs.unlink(inputPath, () => {});
         fs.unlink(outputPath, () => {});
@@ -196,7 +232,7 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
 
     req.on('close', () => {
       if (!res.writableEnded) {
-        clientClosed = true;
+        pdfClientClosed = true;
         child.kill('SIGTERM');
       }
     });
@@ -214,13 +250,13 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
   // Same pattern as the pdf2docx block above: kill the LibreOffice
   // process if the client disconnects before conversion finishes,
   // instead of letting it run to completion on an abandoned upload.
-  let clientClosed = false;
+  let loClientClosed = false;
   const child = exec(command, { timeout: 60000 }, (error, stdout, stderr) => {
     const outFmt = targetFormat === 'jpg' ? 'jpg' : targetFormat;
     const inputBaseName = path.basename(inputPath, path.extname(inputPath));
     const outputPath = path.join(CONVERTED_DIR, `${inputBaseName}.${outFmt}`);
 
-    if (clientClosed) {
+    if (loClientClosed) {
       // Client is gone -- just clean up whatever got produced, res is dead.
       fs.unlink(inputPath, () => {});
       fs.unlink(outputPath, () => {});
@@ -255,7 +291,7 @@ router.post('/convert', convertLimiter, uploadSingleFile, requireUser, async (re
 
   req.on('close', () => {
     if (!res.writableEnded) {
-      clientClosed = true;
+      loClientClosed = true;
       child.kill('SIGTERM');
     }
   });
