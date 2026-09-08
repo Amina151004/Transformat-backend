@@ -30,6 +30,10 @@ export async function syncSubscriptionToProfile(subscription) {
     .update({
       plan: isActive ? 'pro' : 'free',
       pro_expires_at: isActive ? expiresAt : null,
+      // Tracks whether this active subscription is scheduled to lapse
+      // instead of auto-renew, so the app can show "ends on X" instead
+      // of "renews on X" once the user cancels.
+      cancel_at_period_end: isActive ? subscription.cancel_at_period_end : false,
     })
     .eq('id', profile.id);
 }
