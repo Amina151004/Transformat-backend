@@ -64,8 +64,8 @@ export async function imageToPptx(inputPath, outputPath) {
   const pres = new pptxgen();
   const slide = pres.addSlide();
 
-  const slideW = pres.width;  // inches, default 10
-  const slideH = pres.height; // default 7.5
+  const slideW = pres.presLayout.width;   // e.g. 10
+  const slideH = pres.presLayout.height;  // e.g. 5.625 or 7.5 depending on layout
 
   const imgRatio = metadata.width / metadata.height;
   let w = slideW;
