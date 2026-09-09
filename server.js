@@ -10,6 +10,7 @@ import convertRoutes from './routes/convert.js';
 import billingRoutes from './routes/billing.js';
 import accountRoutes from './routes/account.js';
 import webhookRoutes from './routes/webhooks.js';
+import legalRoutes from './routes/legal.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -41,6 +42,7 @@ app.use(debugRoutes);
 app.use(convertRoutes);
 app.use(billingRoutes);
 app.use(accountRoutes);
+app.use(legalRoutes);
 
 app.listen(PORT, () => {
   console.log(`Converter backend running on http://localhost:${PORT}`);
