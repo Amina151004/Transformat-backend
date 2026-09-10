@@ -19,8 +19,11 @@ router.get('/terms', (req, res) => {
 });
 
 router.get('/reset-password', (req, res) => {
-  res.set('Cache-Control', 'no-store');
   res.sendFile(path.join(__dirname, '..', 'public', 'reset-password.html'));
+});
+
+router.get('/email-confirmed', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'public', 'email-confirmed.html'));
 });
 
 export default router;
