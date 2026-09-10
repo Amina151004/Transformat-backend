@@ -18,4 +18,8 @@ router.get('/terms', (req, res) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'terms-of-service.html'));
 });
 
+router.get('/reset-password', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'public', 'reset-password.html'));
+});
+
 export default router;
